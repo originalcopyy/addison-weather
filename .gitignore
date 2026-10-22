@@ -15,3 +15,6 @@ site/
 
 # macOS
 .DS_Store
+
+# Factory flash backups (16 MB, keep local only)
+/*.bin
