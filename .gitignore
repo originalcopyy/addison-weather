@@ -1,0 +1,17 @@
+# ESP-IDF build output and local config (sdkconfig holds your Wi-Fi password)
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# GitHub Actions render output (published to gh-pages, not main)
+site/
+
+# macOS
+.DS_Store

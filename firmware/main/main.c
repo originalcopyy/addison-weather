@@ -1,0 +1,248 @@
+/*
+ * Addison Weather for ZecTrix Note 4C (ESP32-S3 + 4.2" BWRY SSD2683 e-paper)
+ *
+ * Wake -> Wi-Fi -> download 30,000-byte 2bpp frame -> refresh panel only if it
+ * changed -> deep sleep. BOOT button forces an immediate refresh.
+ *
+ * Pins and SSD2683 sequence taken from the ZecTrix wiki and the reference
+ * firmware (LazyYoun/youn-ink-fourcolor-firmware, 2bp branch).
+ */
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_crc.h"
+#include "esp_heap_caps.h"
+#include "esp_crt_bundle.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_sleep.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+
+static const char *TAG = "weather";
+
+/* ---- Board pins (Note 4C) ---- */
+#define PIN_EPD_PWR   GPIO_NUM_6
+#define PIN_EPD_BUSY  GPIO_NUM_8   /* low = busy */
+#define PIN_EPD_RST   GPIO_NUM_9
+#define PIN_EPD_DC    GPIO_NUM_10
+#define PIN_EPD_CS    GPIO_NUM_11
+#define PIN_EPD_SCK   GPIO_NUM_12
+#define PIN_EPD_MOSI  GPIO_NUM_13
+#define PIN_PWR_HOLD  GPIO_NUM_17  /* keeps the board powered on battery */
+#define PIN_LED       GPIO_NUM_3
+#define PIN_BOOT      GPIO_NUM_0
+
+#define EPD_W 400
+#define EPD_H 300
+#define ROW_BYTES (EPD_W / 4)            /* 2bpp -> 100 bytes per row */
+#define FRAME_BYTES (ROW_BYTES * EPD_H)  /* 30,000 */
+
+/* Survives deep sleep: skip the 10+ s refresh when nothing changed */
+RTC_DATA_ATTR static uint32_t s_last_crc = 0;
+
+static spi_device_handle_t s_spi;
+static EventGroupHandle_t s_wifi_ev;
+#define WIFI_OK   BIT0
+#define WIFI_FAIL BIT1
+
+/* ======================= power ======================= */
+static void hold_level(gpio_num_t pin, int level)
+{
+    gpio_hold_dis(pin);
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, level);
+    gpio_hold_en(pin);
+}
+
+/* ======================= SSD2683 ======================= */
+static void spi_tx(const uint8_t *buf, size_t len)
+{
+    spi_transaction_t t = { .length = len * 8, .tx_buffer = buf };
+    ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+}
+
+static void epd_cmd(uint8_t c)
+{
+    gpio_set_level(PIN_EPD_DC, 0);
+    gpio_set_level(PIN_EPD_CS, 0);
+    spi_tx(&c, 1);
+    gpio_set_level(PIN_EPD_CS, 1);
+}
+
+static void epd_data(const uint8_t *d, size_t n)
+{
+    gpio_set_level(PIN_EPD_DC, 1);
+    gpio_set_level(PIN_EPD_CS, 0);
+    spi_tx(d, n);
+    gpio_set_level(PIN_EPD_CS, 1);
+}
+
+static void epd_data1(uint8_t b) { epd_data(&b, 1); }
+
+static void epd_wait(void)
+{
+    int64_t ms = 0;
+    while (gpio_get_level(PIN_EPD_BUSY) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if ((ms += 10) > 120000) { ESP_LOGW(TAG, "busy timeout"); return; }
+    }
+}
+
+static void epd_bus_init(void)
+{
+    gpio_config_t out = {
+        .pin_bit_mask = (1ULL << PIN_EPD_RST) | (1ULL << PIN_EPD_DC) | (1ULL << PIN_EPD_CS),
+        .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&out);
+    gpio_config_t in = { .pin_bit_mask = 1ULL << PIN_EPD_BUSY, .mode = GPIO_MODE_INPUT };
+    gpio_config(&in);
+    gpio_set_level(PIN_EPD_CS, 1);
+    gpio_set_level(PIN_EPD_RST, 1);
+
+    spi_bus_config_t bus = {
+        .mosi_io_num = PIN_EPD_MOSI, .miso_io_num = -1, .sclk_io_num = PIN_EPD_SCK,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4096,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+    spi_device_interface_config_t dev = {
+        .clock_speed_hz = 20 * 1000 * 1000, .mode = 0, .spics_io_num = -1, .queue_size = 1,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &s_spi));
+}
+
+static void epd_show(const uint8_t *frame)
+{
+    hold_level(PIN_EPD_PWR, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(PIN_EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(PIN_EPD_RST, 0); vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(PIN_EPD_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
+    epd_wait();
+
+    epd_cmd(0xE9); epd_data1(0x01);          /* 4-color init */
+
+    epd_cmd(0x10);                            /* DTM1: raw 2bpp stream */
+    epd_wait();
+    for (int y = 0; y < EPD_H; y++) {
+        epd_data(frame + y * ROW_BYTES, ROW_BYTES);
+    }
+
+    epd_cmd(0x04); epd_wait(); vTaskDelay(pdMS_TO_TICKS(10));   /* power on */
+    epd_cmd(0x12); epd_data1(0x00);                              /* refresh  */
+    vTaskDelay(pdMS_TO_TICKS(10)); epd_wait();
+    epd_cmd(0x02); epd_data1(0x00); epd_wait();                  /* power off */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    epd_cmd(0x07); epd_data1(0xA5);                              /* deep sleep */
+    hold_level(PIN_EPD_PWR, 0);
+}
+
+/* ======================= Wi-Fi ======================= */
+static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    static int retries = 0;
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (++retries <= 5) esp_wifi_connect();
+        else xEventGroupSetBits(s_wifi_ev, WIFI_FAIL);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_wifi_ev, WIFI_OK);
+    }
+}
+
+static bool wifi_up(void)
+{
+    s_wifi_ev = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_evt, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_evt, NULL);
+
+    wifi_config_t wc = { 0 };
+    strlcpy((char *)wc.sta.ssid, CONFIG_WEATHER_WIFI_SSID, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, CONFIG_WEATHER_WIFI_PASSWORD, sizeof(wc.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t b = xEventGroupWaitBits(s_wifi_ev, WIFI_OK | WIFI_FAIL, pdFALSE, pdFALSE,
+                                        pdMS_TO_TICKS(20000));
+    return b & WIFI_OK;
+}
+
+/* ======================= download ======================= */
+static bool fetch_frame(uint8_t *buf)
+{
+    esp_http_client_config_t c = {
+        .url = CONFIG_WEATHER_IMAGE_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 15000,
+    };
+    esp_http_client_handle_t h = esp_http_client_init(&c);
+    bool ok = false;
+    if (esp_http_client_open(h, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(h);
+        int status = esp_http_client_get_status_code(h);
+        int got = 0, n;
+        while (got < FRAME_BYTES &&
+               (n = esp_http_client_read(h, (char *)buf + got, FRAME_BYTES - got)) > 0) {
+            got += n;
+        }
+        ok = (status == 200 && got == FRAME_BYTES);
+        ESP_LOGI(TAG, "HTTP %d, %d bytes", status, got);
+    }
+    esp_http_client_cleanup(h);
+    return ok;
+}
+
+/* ======================= main ======================= */
+static void sleep_for(uint32_t minutes)
+{
+    esp_wifi_stop();
+    hold_level(PIN_PWR_HOLD, 1);
+    hold_level(PIN_LED, 0);
+    esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup(PIN_BOOT, 0);      /* BOOT = refresh now */
+    ESP_LOGI(TAG, "sleeping %lu min", (unsigned long)minutes);
+    esp_deep_sleep_start();
+}
+
+void app_main(void)
+{
+    hold_level(PIN_PWR_HOLD, 1);   /* latch power first */
+    hold_level(PIN_LED, 1);
+
+    bool forced = (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_EXT0)) != 0;
+
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    uint8_t *frame = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!frame || !wifi_up() || !fetch_frame(frame)) {
+        ESP_LOGW(TAG, "update failed, keeping current screen");
+        sleep_for(CONFIG_WEATHER_RETRY_MINUTES);
+    }
+
+    uint32_t crc = esp_crc32_le(0, frame, FRAME_BYTES);
+    if (crc != s_last_crc || forced) {
+        epd_bus_init();
+        epd_show(frame);
+        s_last_crc = crc;
+        ESP_LOGI(TAG, "screen updated");
+    } else {
+        ESP_LOGI(TAG, "unchanged, skipping refresh");
+    }
+    sleep_for(CONFIG_WEATHER_REFRESH_MINUTES);
+}
