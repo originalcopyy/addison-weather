@@ -18,7 +18,7 @@ renderer/render.py ── Open-Meteo ──► weather.bin ──HTTPS──► 
 3. Settings → Pages → Source: *Deploy from branch* → `gh-pages` / root.
 4. Check `https://<you>.github.io/addison-weather/weather.png` in a browser.
 
-Local test: `pip install -r renderer/requirements.txt && python renderer/render.py` → `renderer/out/`.
+Local test: `pip install -r renderer/requirements.txt && python renderer/render.py` → `renderer/out/`. Tests: `python -m unittest renderer/test_render.py`.
 
 ## 2. Back up the factory firmware (do this once)
 

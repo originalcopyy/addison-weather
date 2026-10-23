@@ -45,7 +45,7 @@ def fetch_live():
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={LAT}&longitude={LON}"
         "&current=temperature_2m,weather_code,is_day"
-        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"
         "&temperature_unit=fahrenheit&timezone=America%2FChicago&forecast_days=5"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "note4c-weather/1.0"})
@@ -153,6 +153,15 @@ def umbrella(d, cx, cy, r):
     d.line([cx, cy - r * 0.05, cx, cy + r * 0.55], fill=BLACK, width=2)
 
 
+def sun_marker(d, x, y, rising):
+    """Sunrise/sunset glyph in an 18 x 16 box at (x, y): arrow, yellow half-disc, horizon line."""
+    cx = x + 9
+    tri = [(cx - 4, y + 5), (cx + 4, y + 5), (cx, y + 1)] if rising else [(cx - 4, y + 1), (cx + 4, y + 1), (cx, y + 5)]
+    d.polygon(tri, fill=BLACK)
+    d.pieslice([cx - 7, y + 7, cx + 7, y + 21], 180, 360, fill=YELLOW)
+    d.line([x, y + 14, x + 18, y + 14], fill=BLACK, width=2)
+
+
 # ---------------------------------------------------------------- text helpers
 def text(d, xy, s, f, fill=BLACK, anchor="la"):
     d.text(xy, s, font=f, fill=fill, anchor=anchor)
@@ -161,6 +170,18 @@ def text(d, xy, s, f, fill=BLACK, anchor="la"):
 
 def deg(n):
     return f"{round(n)}°"
+
+
+def clock_parts(iso):
+    """'2026-10-22T07:12' -> ('7:12', 'AM')"""
+    t = datetime.fromisoformat(iso)
+    return t.strftime("%-I:%M"), t.strftime("%p")
+
+
+def daylight_label(sunrise, sunset):
+    """Daylight between two local ISO timestamps, e.g. '10H 47M'."""
+    mins = round((datetime.fromisoformat(sunset) - datetime.fromisoformat(sunrise)).total_seconds() / 60)
+    return f"{mins // 60}H {mins % 60:02d}M"
 
 
 # ---------------------------------------------------------------- banner logic
@@ -202,6 +223,18 @@ def render(data):
     l, tp, r, _ = d.textbbox((206, 92), t, font=tf, anchor="rm")
     text(d, (206, 92), t, tf, anchor="rm")
     d.ellipse([r + 3, tp + 2, r + 15, tp + 14], outline=BLACK, width=3)
+
+    # --- sunrise / sunset / daylight, under the hero
+    if days.get("sunrise") and days.get("sunset"):
+        sr, ss = days["sunrise"][0], days["sunset"][0]
+        y, x = 164, 14  # baseline, left edge
+        for iso, rising in ((sr, True), (ss, False)):
+            sun_marker(d, x, y - 16, rising)
+            x += 20
+            hm, ap = clock_parts(iso)
+            x += text(d, (x, y), hm, font(700, 20), anchor="ls") + 1
+            x += text(d, (x, y), ap, font(700, 12), anchor="ls") + 6
+        text(d, (212, y), daylight_label(sr, ss), font(800, 15), fill=RED, anchor="rs")
 
     # divider
     d.line([226, 16, 226, 160], fill=BLACK, width=2)
