@@ -9,7 +9,7 @@ renderer/render.py ── Open-Meteo ──► weather.bin ──HTTPS──► 
 ```
 
 - **Renderer** (`renderer/`): Python + Pillow. Pulls Open-Meteo (no API key), draws a 400×300 frame using only the four panel colors, and packs it as the SSD2683's native 2bpp stream (30,000 bytes).
-- **Firmware** (`firmware/`): ESP-IDF 6.0. Downloads the frame, skips the 10+ s refresh if the CRC is unchanged, deep-sleeps. Press **BOOT** to force a refresh.
+- **Firmware** (`firmware/`): ESP-IDF 6.0. Downloads the frame, skips the 10+ s refresh if the CRC is unchanged, deep-sleeps. Press **DOWN** (the side button) to force a refresh; hold it to power the board on. The front LED lights only while on USB power.
 
 ## 1. Host the image (GitHub Pages, free)
 

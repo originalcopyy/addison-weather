@@ -13,6 +13,8 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_crc.h"
+#include "esp_bit_defs.h"
+#include "driver/rtc_io.h"
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -34,8 +36,10 @@ static const char *TAG = "weather";
 #define PIN_EPD_SCK   GPIO_NUM_12
 #define PIN_EPD_MOSI  GPIO_NUM_13
 #define PIN_PWR_HOLD  GPIO_NUM_17  /* keeps the board powered on battery */
-#define PIN_LED       GPIO_NUM_3
-#define PIN_BOOT      GPIO_NUM_0
+#define PIN_LED       GPIO_NUM_3   /* active-low */
+#define PIN_DOWN      GPIO_NUM_18  /* side button; also the hardware power key */
+#define PIN_CHG_DET   GPIO_NUM_2   /* low while the battery is charging */
+#define PIN_CHG_FULL  GPIO_NUM_1   /* high when charged and still on USB */
 
 #define EPD_W 400
 #define EPD_H 300
@@ -57,6 +61,17 @@ static void hold_level(gpio_num_t pin, int level)
     gpio_set_direction(pin, GPIO_MODE_OUTPUT);
     gpio_set_level(pin, level);
     gpio_hold_en(pin);
+}
+
+static bool usb_power_present(void)
+{
+    return gpio_get_level(PIN_CHG_DET) == 0 || gpio_get_level(PIN_CHG_FULL) == 1;
+}
+
+/* The LED is lit only while USB power is present (it is active-low). */
+static void led_show_power(void)
+{
+    hold_level(PIN_LED, usb_power_present() ? 0 : 1);
 }
 
 /* ======================= SSD2683 ======================= */
@@ -209,19 +224,38 @@ static void sleep_for(uint32_t minutes)
 {
     esp_wifi_stop();
     hold_level(PIN_PWR_HOLD, 1);
-    hold_level(PIN_LED, 0);
+    led_show_power();
     esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
-    esp_sleep_enable_ext0_wakeup(PIN_BOOT, 0);      /* BOOT = refresh now */
+    /* DOWN wakes for a forced refresh. BOOT (GPIO0) is a strapping pin and a
+     * wake on it can land in download mode, so it is not used. Plugging in
+     * USB wakes too, so the LED comes on promptly; that pin is armed only
+     * while it is high, or it would retrigger at once while charging. */
+    uint64_t wake_mask = BIT64(PIN_DOWN);
+    rtc_gpio_pullup_en(PIN_DOWN);
+    rtc_gpio_pulldown_dis(PIN_DOWN);
+    if (gpio_get_level(PIN_CHG_DET) == 1) wake_mask |= BIT64(PIN_CHG_DET);
+    esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    /* Without this the held pads (battery latch, LED, panel power) are
+     * released on deep sleep and the board powers off on battery. */
+    gpio_deep_sleep_hold_en();
     ESP_LOGI(TAG, "sleeping %lu min", (unsigned long)minutes);
+    vTaskDelay(pdMS_TO_TICKS(50));   /* let the USB console drain */
     esp_deep_sleep_start();
 }
 
 void app_main(void)
 {
     hold_level(PIN_PWR_HOLD, 1);   /* latch power first */
-    hold_level(PIN_LED, 1);
+    gpio_config_t chg = { .pin_bit_mask = (1ULL << PIN_CHG_DET) | (1ULL << PIN_CHG_FULL),
+                          .mode = GPIO_MODE_INPUT };
+    gpio_config(&chg);
+    led_show_power();
 
-    bool forced = (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_EXT0)) != 0;
+    uint64_t ext1 = (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_EXT1))
+                        ? esp_sleep_get_ext1_wakeup_status() : 0;
+    bool forced = (ext1 & BIT64(PIN_DOWN)) != 0;   /* DOWN pressed: refresh even if unchanged */
+    ESP_LOGI(TAG, "wake: %s, usb %s", forced ? "DOWN button" : (ext1 ? "USB plugged in" : "timer or power-on"),
+             usb_power_present() ? "present" : "absent");
 
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
