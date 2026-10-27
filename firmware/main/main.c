@@ -56,6 +56,7 @@ RTC_DATA_ATTR static uint32_t s_last_crc = 0;
 
 static spi_device_handle_t s_spi;
 static EventGroupHandle_t s_wifi_ev;
+static bool s_skip_usb_wake;   /* set after a USB-plug wake that had no USB behind it */
 #define WIFI_OK   BIT0
 #define WIFI_FAIL BIT1
 
@@ -280,7 +281,7 @@ static void sleep_for(uint32_t minutes)
     uint64_t wake_mask = BIT64(PIN_DOWN);
     rtc_gpio_pullup_en(PIN_DOWN);
     rtc_gpio_pulldown_dis(PIN_DOWN);
-    if (gpio_get_level(PIN_CHG_DET) == 1) wake_mask |= BIT64(PIN_CHG_DET);
+    if (!s_skip_usb_wake && gpio_get_level(PIN_CHG_DET) == 1) wake_mask |= BIT64(PIN_CHG_DET);
     esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     /* Without this the held pads (battery latch, LED, panel power) are
      * released on deep sleep and the board powers off on battery. */
@@ -300,9 +301,19 @@ void app_main(void)
 
     uint64_t ext1 = (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_EXT1))
                         ? esp_sleep_get_ext1_wakeup_status() : 0;
-    bool forced = (ext1 & BIT64(PIN_DOWN)) != 0;   /* DOWN pressed: refresh even if unchanged */
-    ESP_LOGI(TAG, "wake: %s, usb %s", forced ? "DOWN button" : (ext1 ? "USB plugged in" : "timer or power-on"),
-             usb_power_present() ? "present" : "absent");
+    bool forced = (ext1 & BIT64(PIN_DOWN)) != 0;   /* DOWN pressed: fetch now, refresh even if unchanged */
+    bool plugged = (ext1 & BIT64(PIN_CHG_DET)) != 0;
+    bool usb = usb_power_present();
+    ESP_LOGI(TAG, "wake: %s, usb %s", forced ? "DOWN button" : plugged ? "USB plug" : "timer or power-on",
+             usb ? "present" : "absent");
+    if (plugged && !forced && !usb) {
+        /* The charge-detect line dipped with no USB behind it. Do not spend a
+         * Wi-Fi session and a 22 s refresh on noise, and leave that pin
+         * un-armed for this sleep so a bouncing line cannot drain the battery. */
+        ESP_LOGW(TAG, "spurious USB wake, back to sleep");
+        s_skip_usb_wake = true;
+        sleep_for(CONFIG_WEATHER_REFRESH_MINUTES);
+    }
 
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
