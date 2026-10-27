@@ -53,7 +53,7 @@ idf.py build
 idf.py -p /dev/cu.usbmodemXXXX flash monitor
 ```
 
-The board's USB port only exists while it is awake (about 30 s per update, or after a DOWN press), so start the flash and then press DOWN.
+The board's USB port only exists while it is awake (about 30 s per update, or after a DOWN press). `firmware/flash.sh` waits for the port and flashes the current build: start it, then plug in USB or hold DOWN.
 
 Expected log: `battery 82% (3990 mV)` → `HTTP 200, 30000 bytes` → `screen updated` → `sleeping 30 min`.
 
