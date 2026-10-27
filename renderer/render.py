@@ -7,7 +7,7 @@ Outputs:
 
 Usage:
   python3 render.py                 # live data from Open-Meteo (no API key)
-  python3 render.py --sample sample.json
+  python3 render.py --sample sample.json --battery 82
 """
 import argparse
 import json
@@ -153,6 +153,25 @@ def umbrella(d, cx, cy, r):
     d.line([cx, cy - r * 0.05, cx, cy + r * 0.55], fill=BLACK, width=2)
 
 
+def battery_color(pct):
+    """Gauge fill: white when comfortable, yellow when getting low, red when it is time to charge."""
+    return WHITE if pct >= 50 else YELLOW if pct >= 20 else RED
+
+
+GAUGE_W, GAUGE_H = 28, 12
+
+
+def battery_gauge(d, x, y, pct):
+    """Battery outline (GAUGE_W x GAUGE_H at x, y) on a dark background, body filled to pct."""
+    body = x + GAUGE_W - 3                      # last column of the body; the nub takes the rest
+    d.rounded_rectangle([x, y, body, y + GAUGE_H - 1], radius=2, outline=WHITE, width=1)
+    d.rectangle([body + 1, y + 3, x + GAUGE_W - 1, y + GAUGE_H - 4], fill=WHITE)
+    inner = body - 2 - (x + 2) + 1              # columns available inside a 2 px inset
+    fill = round(inner * pct / 100)
+    if fill:
+        d.rectangle([x + 2, y + 2, x + 1 + fill, y + GAUGE_H - 3], fill=battery_color(pct))
+
+
 def sun_marker(d, x, y, rising):
     """Sunrise/sunset glyph in an 18 x 16 box at (x, y): arrow, yellow half-disc, horizon line."""
     cx = x + 9
@@ -185,6 +204,27 @@ def daylight_label(sunrise, sunset):
 
 
 # ---------------------------------------------------------------- banner logic
+DAY_NAMES = {"MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"}
+BANNER_X = 20          # where the banner text (or its umbrella) starts
+UMBRELLA_W = 26
+
+
+def fit_banner(measure, lead, hi, umb, max_right):
+    """Shorten a banner line until it ends before max_right; measure(text) gives a width in px.
+
+    First the day name goes to three letters, then the umbrella goes. Anything else is kept.
+    """
+    def end(h, u):
+        return BANNER_X + (UMBRELLA_W if u else 0) + measure(lead + " ") + measure(h)
+    if end(hi, umb) <= max_right:
+        return lead, hi, umb
+    if hi in DAY_NAMES:
+        hi = hi[:3]
+    if end(hi, umb) <= max_right:
+        return lead, hi, umb
+    return lead, hi, False
+
+
 def banner(days, now):
     """Return (lead_text, highlight_text, show_umbrella)."""
     names = ["TODAY"] + [datetime.fromisoformat(t).strftime("%A").upper() for t in days["time"][1:]]
@@ -206,9 +246,10 @@ def banner(days, now):
 
 
 # ---------------------------------------------------------------- layout
-def render(data):
-    tz = ZoneInfo(TZ)
-    now = datetime.now(tz)
+def render(data, battery=None, now=None):
+    """Draw the board. battery is a 0-100 percent for the gauge (None hides it); now defaults to local time."""
+    if now is None:
+        now = datetime.now(ZoneInfo(TZ))
     cur, days = data["current"], data["daily"]
 
     img = Image.new("RGB", (W, H), WHITE)
@@ -281,18 +322,27 @@ def render(data):
             text(d, (rx, yy), deg(val), vf, fill=col, anchor="rm")
             text(d, (rx - vw - 4, yy), lbl, lf, anchor="rm")
 
-    # --- banner
-    by = 268
+    # --- banner: message on the left; clock, battery gauge and percent on the right
+    by, my = 268, 281
     d.rounded_rectangle([10, by, 390, by + 26], radius=4, fill=BLACK)
-    lead, hi, umb = banner(days, now)
-    bx = 20
-    if umb:
-        umbrella(d, bx + 10, by + 13, 10)
-        bx += 26
+    sf = font(600, 15)
+    right = 382
+    if battery is not None:
+        pct = max(0, min(100, int(battery)))
+        label = f"{pct}%"
+        right = 384 - text(d, (384, my), label, sf, fill=RED if pct < 20 else WHITE, anchor="rm") - 4 - GAUGE_W
+        battery_gauge(d, right, my - GAUGE_H // 2, pct)
+        right -= 6
+    clock = now.strftime("%-I:%M %p")
+    right -= text(d, (right, my), clock, sf, fill=WHITE, anchor="rm")
     bf = font(700, 19)
-    bx += text(d, (bx, by + 13), lead + " ", bf, fill=WHITE, anchor="lm")
-    text(d, (bx, by + 13), hi, bf, fill=YELLOW, anchor="lm")
-    text(d, (382, by + 13), now.strftime("%-I:%M %p"), font(600, 15), fill=WHITE, anchor="rm")
+    lead, hi, umb = fit_banner(lambda s: d.textlength(s, font=bf), *banner(days, now), max_right=right - 8)
+    bx = BANNER_X
+    if umb:
+        umbrella(d, bx + 10, my, 10)
+        bx += UMBRELLA_W
+    bx += text(d, (bx, my), lead + " ", bf, fill=WHITE, anchor="lm")
+    text(d, (bx, my), hi, bf, fill=YELLOW, anchor="lm")
     return img
 
 
@@ -332,9 +382,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", help="render from a saved Open-Meteo JSON file instead of fetching")
     ap.add_argument("--out", default=os.path.join(HERE, "out"))
+    ap.add_argument("--battery", type=int, help="battery percent to show in the banner gauge")
     a = ap.parse_args()
     data = json.load(open(a.sample)) if a.sample else fetch_live()
-    img = render(data)
+    img = render(data, battery=a.battery)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "weather.bin"), "wb") as f:
         f.write(encode(img))
