@@ -1,0 +1,9 @@
+# Only the renderer and the api/ entry point are needed on Vercel
+firmware
+docs
+.github
+.venv
+renderer/out
+renderer/test_*.py
+*.bin
+*.md

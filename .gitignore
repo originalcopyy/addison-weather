@@ -18,3 +18,7 @@ site/
 
 # Factory flash backups (16 MB, keep local only)
 /*.bin
+
+# Vercel project link
+.vercel/
+.vercel

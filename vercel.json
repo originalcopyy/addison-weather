@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/weather.bin", "destination": "/api/weather" },
+    { "source": "/weather.png", "destination": "/api/weather?fmt=png" },
+    { "source": "/", "destination": "/api/weather?fmt=png" }
+  ]
+}
