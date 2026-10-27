@@ -1,8 +1,9 @@
 /*
  * Addison Weather for ZecTrix Note 4C (ESP32-S3 + 4.2" BWRY SSD2683 e-paper)
  *
- * Wake -> Wi-Fi -> download 30,000-byte 2bpp frame -> refresh panel only if it
- * changed -> deep sleep. BOOT button forces an immediate refresh.
+ * Wake -> Wi-Fi -> download 30,000-byte 2bpp frame (rendered on demand by the
+ * web function, with this board's battery percent in the query) -> refresh the
+ * panel -> deep sleep. The DOWN button wakes the board for a fetch right now.
  *
  * Pins and SSD2683 sequence taken from the ZecTrix wiki and the reference
  * firmware (LazyYoun/youn-ink-fourcolor-firmware, 2bp branch).
@@ -15,6 +16,9 @@
 #include "esp_crc.h"
 #include "esp_bit_defs.h"
 #include "driver/rtc_io.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -40,6 +44,7 @@ static const char *TAG = "weather";
 #define PIN_DOWN      GPIO_NUM_18  /* side button; also the hardware power key */
 #define PIN_CHG_DET   GPIO_NUM_2   /* low while the battery is charging */
 #define PIN_CHG_FULL  GPIO_NUM_1   /* high when charged and still on USB */
+#define BATT_ADC_CH   ADC_CHANNEL_3 /* GPIO4, battery through a 1:2 divider */
 
 #define EPD_W 400
 #define EPD_H 300
@@ -72,6 +77,40 @@ static bool usb_power_present(void)
 static void led_show_power(void)
 {
     hold_level(PIN_LED, usb_power_present() ? 0 : 1);
+}
+
+/* Battery percent (0-100) from a 10-sample ADC average, or -1 if the ADC is
+ * unavailable. Divider and curve are the ones the vendor firmware uses:
+ * about 3.3 V reads 0 % and 4.2 V reads 100 %. */
+static int read_battery_percent(int *millivolts)
+{
+    adc_oneshot_unit_handle_t adc = NULL;
+    adc_cali_handle_t cali = NULL;
+    adc_oneshot_unit_init_cfg_t unit = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_chan_cfg_t chan = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12 };
+    adc_cali_curve_fitting_config_t fit = {
+        .unit_id = ADC_UNIT_1, .chan = BATT_ADC_CH, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12,
+    };
+    int sum = 0, samples = 0;
+    if (adc_oneshot_new_unit(&unit, &adc) == ESP_OK &&
+        adc_oneshot_config_channel(adc, BATT_ADC_CH, &chan) == ESP_OK &&
+        adc_cali_create_scheme_curve_fitting(&fit, &cali) == ESP_OK) {
+        for (int i = 0; i < 10; i++) {
+            int raw, mv;
+            if (adc_oneshot_read(adc, BATT_ADC_CH, &raw) == ESP_OK &&
+                adc_cali_raw_to_voltage(cali, raw, &mv) == ESP_OK) {
+                sum += mv * 2;
+                samples++;
+            }
+        }
+    }
+    if (cali) adc_cali_delete_scheme_curve_fitting(cali);
+    if (adc) adc_oneshot_del_unit(adc);
+    if (samples == 0) return -1;
+    int avg = sum / samples;
+    int pct = (-avg * avg + 9016 * avg - 19189000) / 10000;
+    *millivolts = avg;
+    return pct < 0 ? 0 : pct > 100 ? 100 : pct;
 }
 
 /* ======================= SSD2683 ======================= */
@@ -195,12 +234,20 @@ static bool wifi_up(void)
 }
 
 /* ======================= download ======================= */
-static bool fetch_frame(uint8_t *buf)
+static bool fetch_frame(uint8_t *buf, int battery)
 {
+    /* The server draws the battery gauge, so the reading rides along in the query. */
+    char url[256];
+    if (battery >= 0) {
+        snprintf(url, sizeof url, "%s%cbatt=%d", CONFIG_WEATHER_IMAGE_URL,
+                 strchr(CONFIG_WEATHER_IMAGE_URL, '?') ? '&' : '?', battery);
+    } else {
+        strlcpy(url, CONFIG_WEATHER_IMAGE_URL, sizeof url);
+    }
     esp_http_client_config_t c = {
-        .url = CONFIG_WEATHER_IMAGE_URL,
+        .url = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 15000,
+        .timeout_ms = 20000,   /* the frame is rendered on demand; allow for a cold start */
     };
     esp_http_client_handle_t h = esp_http_client_init(&c);
     bool ok = false;
@@ -263,8 +310,12 @@ void app_main(void)
         nvs_flash_init();
     }
 
+    int mv = 0, battery = read_battery_percent(&mv);
+    if (battery >= 0) ESP_LOGI(TAG, "battery %d%% (%d mV)", battery, mv);
+    else ESP_LOGW(TAG, "battery reading unavailable");
+
     uint8_t *frame = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!frame || !wifi_up() || !fetch_frame(frame)) {
+    if (!frame || !wifi_up() || !fetch_frame(frame, battery)) {
         ESP_LOGW(TAG, "update failed, keeping current screen");
         sleep_for(CONFIG_WEATHER_RETRY_MINUTES);
     }

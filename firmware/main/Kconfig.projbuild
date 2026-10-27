@@ -6,8 +6,8 @@ menu "Addison Weather"
         string "Wi-Fi password"
         default "your-password"
     config WEATHER_IMAGE_URL
-        string "URL of weather.bin"
-        default "https://YOUR-GITHUB-USER.github.io/addison-weather/weather.bin"
+        string "URL of weather.bin (the board appends ?batt=<percent>)"
+        default "https://addison-weather.vercel.app/weather.bin"
     config WEATHER_REFRESH_MINUTES
         int "Minutes between updates"
         default 60
